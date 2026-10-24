@@ -1,8 +1,7 @@
-"""Read the waybill QR/barcode in each image in a folder and rename the image to it.
+"""Read the waybill QR code in each image in a folder and rename the image to it.
 
-Supports J&T, Flash Express and Shopee Express (see COURIER_PATTERNS). Product
-QR codes are ignored. A code in an unrecognised format is still used but marked
-CHECK_UNKNOWN_FORMAT in the log so it can be verified.
+Works for any courier: the waybill is the first QR code that is not one of our
+own labels (codes starting with IGNORE_PREFIXES, e.g. product QR codes).
 
 Usage:
     python pod_qr_rename.py <folder> [--output <folder>] [--dry-run] [--recursive]
@@ -26,16 +25,9 @@ import zxingcpp
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
-# Waybill number formats per courier, checked in order against each code's full text.
-# Add or adjust a line here when a new courier/format shows up.
-COURIER_PATTERNS = {
-    "J&T": r"JT\d{10,}",                    # e.g. JT0025708988214 (confirmed)
-    "SPX": r"(SPX|SPE)PH\w{8,}|PH\d{10,}",  # e.g. SPXPH012345678901 (unconfirmed)
-    "Flash": r"P[0-9A-Z]{11,16}",            # e.g. P42038EQCRFF7 (unconfirmed)
-}
-
-# Codes that are never waybills (our own product labels, e.g. NBTUIPOPL0250G)
-IGNORE_PATTERN = r"NB[A-Z0-9]+"
+# QR codes starting with these are our own labels, never waybills
+# (e.g. product code NBTUIPOPL0250G). Add a prefix here to ignore more.
+IGNORE_PREFIXES = ("NB", "LS")
 
 
 def load_image(path):
@@ -60,30 +52,21 @@ def _variants(img):
 
 
 def read_codes(img):
-    """Return all QR/barcode values found in the image, QR codes first."""
+    """Return all QR code values found in the image (barcodes are ignored)."""
     found = {}
     for variant in _variants(img):
-        for r in zxingcpp.read_barcodes(variant):
+        for r in zxingcpp.read_barcodes(variant, formats=zxingcpp.BarcodeFormat.QRCode):
             if r.text and r.text.strip():
-                is_qr = "QR" in r.format.name
-                found[r.text.strip()] = found.get(r.text.strip(), False) or is_qr
-    return sorted(found, key=lambda v: not found[v])
+                found[r.text.strip()] = True
+    return list(found)
 
 
-def pick_waybill(codes, patterns):
-    """Return (waybill, courier) for the codes found in one image.
-
-    A code matching a known courier format wins. Otherwise any code that is not
-    a product code is returned with courier "UNKNOWN" so it can be checked.
-    """
-    for courier, pattern in patterns.items():
-        for code in codes:
-            if re.fullmatch(pattern, code, re.IGNORECASE):
-                return code, courier
+def pick_waybill(codes):
+    """Return the first code that is not one of our own labels, or None."""
     for code in codes:
-        if not re.fullmatch(IGNORE_PATTERN, code, re.IGNORECASE):
-            return code, "UNKNOWN"
-    return None, None
+        if not code.upper().startswith(IGNORE_PREFIXES):
+            return code
+    return None
 
 
 def safe_filename(text):
@@ -100,7 +83,7 @@ def unique_target(folder, stem, ext, current, claimed):
     return target
 
 
-def process(folder, dry_run=False, recursive=False, output=None, patterns=COURIER_PATTERNS):
+def process(folder, dry_run=False, recursive=False, output=None):
     glob_pattern = "**/*" if recursive else "*"
     files = sorted(p for p in folder.glob(glob_pattern)
                    if p.is_file() and p.suffix.lower() in IMAGE_EXTS
@@ -112,20 +95,20 @@ def process(folder, dry_run=False, recursive=False, output=None, patterns=COURIE
     if output and not dry_run:
         output.mkdir(parents=True, exist_ok=True)
     log_path = (output if output and not dry_run else folder) / f"qr_rename_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
-    renamed = failed = check = 0
+    renamed = failed = 0
     rows = []
     claimed = set()  # names already assigned this run (needed for --dry-run)
 
     for i, path in enumerate(files, 1):
         img = load_image(path)
         if img is None:
-            status, qr, courier, new_name, codes = "UNREADABLE_IMAGE", "", "", "", []
+            status, qr, new_name, codes = "UNREADABLE_IMAGE", "", "", []
         else:
             codes = read_codes(img)
-            qr, courier = pick_waybill(codes, patterns)
+            qr = pick_waybill(codes)
             stem = safe_filename(qr) if qr else None
             if not stem:
-                status, qr, courier, new_name = "NO_WAYBILL_FOUND", "", "", ""
+                status, qr, new_name = "NO_WAYBILL_FOUND", "", ""
             else:
                 target = unique_target(output or path.parent, stem, path.suffix.lower(), path, claimed)
                 claimed.add(target)
@@ -140,25 +123,21 @@ def process(folder, dry_run=False, recursive=False, output=None, patterns=COURIE
                 else:
                     path.rename(target)
                     status = "RENAMED"
-                if courier == "UNKNOWN" and status != "ALREADY_NAMED":
-                    status = "CHECK_UNKNOWN_FORMAT"
 
-        if status == "CHECK_UNKNOWN_FORMAT":
-            check += 1
-        elif status in ("RENAMED", "COPIED", "DRY_RUN"):
+        if status in ("RENAMED", "COPIED", "DRY_RUN"):
             renamed += 1
         elif status != "ALREADY_NAMED":
             failed += 1
-        print(f"[{i}/{len(files)}] {path.name} -> {new_name or '-'}  ({courier or '-'}, {status})")
-        rows.append([path.name, courier, qr, new_name, status, " | ".join(codes)])
+        print(f"[{i}/{len(files)}] {path.name} -> {new_name or '-'}  ({status})")
+        rows.append([path.name, qr, new_name, status, " | ".join(codes)])
 
     with open(log_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["original_file", "courier", "waybill", "new_file", "status", "all_codes_found"])
+        writer.writerow(["original_file", "waybill", "new_file", "status", "all_qr_found"])
         writer.writerows(rows)
 
     verb = "Would rename" if dry_run else ("Copied" if output else "Renamed")
-    print(f"\n{verb}: {renamed}   Check (unknown format): {check}   Failed: {failed}   Total: {len(files)}")
+    print(f"\n{verb}: {renamed}   Failed: {failed}   Total: {len(files)}")
     print(f"Log saved: {log_path}")
 
 
