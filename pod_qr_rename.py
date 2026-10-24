@@ -1,25 +1,41 @@
-"""Read QR codes from images in a folder and rename each image to its QR value.
+"""Read the waybill QR/barcode in each image in a folder and rename the image to it.
+
+Supports J&T, Flash Express and Shopee Express (see COURIER_PATTERNS). Product
+QR codes are ignored. A code in an unrecognised format is still used but marked
+CHECK_UNKNOWN_FORMAT in the log so it can be verified.
 
 Usage:
-    python pod_qr_rename.py <folder> [--dry-run] [--recursive]
+    python pod_qr_rename.py <folder> [--output <folder>] [--dry-run] [--recursive]
 
-Images whose QR code cannot be read are left untouched and listed in the log.
+With --output, images are copied to that folder under the waybill name and the
+originals are left untouched. Images whose waybill code cannot be read are left
+untouched and listed in the log.
 """
 import argparse
 import csv
 import re
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
+import zxingcpp
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
-_detector = cv2.QRCodeDetector()
-_aruco_detector = cv2.QRCodeDetectorAruco() if hasattr(cv2, "QRCodeDetectorAruco") else None
+# Waybill number formats per courier, checked in order against each code's full text.
+# Add or adjust a line here when a new courier/format shows up.
+COURIER_PATTERNS = {
+    "J&T": r"JT\d{10,}",                    # e.g. JT0025708988214 (confirmed)
+    "SPX": r"(SPX|SPE)PH\w{8,}|PH\d{10,}",  # e.g. SPXPH012345678901 (unconfirmed)
+    "Flash": r"P[0-9A-Z]{11,16}",            # e.g. P42038EQCRFF7 (unconfirmed)
+}
+
+# Codes that are never waybills (our own product labels, e.g. NBTUIPOPL0250G)
+IGNORE_PATTERN = r"NB[A-Z0-9]+"
 
 
 def load_image(path):
@@ -30,42 +46,44 @@ def load_image(path):
 
 def _variants(img):
     """Yield progressively more processed versions of the image to try decoding."""
-    yield img
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     yield gray
     h, w = gray.shape
-    # Large phone photos: downscale; tiny images: upscale
+    # Large phone photos often decode better downscaled; tiny images upscaled
     if max(h, w) > 2000:
-        scale = 2000 / max(h, w)
-        yield cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        yield cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
     if max(h, w) < 800:
         yield cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    yield cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    yield cv2.filter2D(gray, -1, np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]]))
     yield cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                 cv2.THRESH_BINARY, 51, 10)
-    sharpened = cv2.filter2D(gray, -1, np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]]))
-    yield sharpened
-    for rot in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
-        yield cv2.rotate(gray, rot)
 
 
-def read_qr(img):
-    """Return the first non-empty QR value found in the image, or None."""
-    detectors = [d for d in (_detector, _aruco_detector) if d is not None]
+def read_codes(img):
+    """Return all QR/barcode values found in the image, QR codes first."""
+    found = {}
     for variant in _variants(img):
-        for det in detectors:
-            try:
-                ok, values, _, _ = det.detectAndDecodeMulti(variant)
-                if ok:
-                    for v in values:
-                        if v and v.strip():
-                            return v.strip()
-                value, _, _ = det.detectAndDecode(variant)
-                if value and value.strip():
-                    return value.strip()
-            except cv2.error:
-                continue
-    return None
+        for r in zxingcpp.read_barcodes(variant):
+            if r.text and r.text.strip():
+                is_qr = "QR" in r.format.name
+                found[r.text.strip()] = found.get(r.text.strip(), False) or is_qr
+    return sorted(found, key=lambda v: not found[v])
+
+
+def pick_waybill(codes, patterns):
+    """Return (waybill, courier) for the codes found in one image.
+
+    A code matching a known courier format wins. Otherwise any code that is not
+    a product code is returned with courier "UNKNOWN" so it can be checked.
+    """
+    for courier, pattern in patterns.items():
+        for code in codes:
+            if re.fullmatch(pattern, code, re.IGNORECASE):
+                return code, courier
+    for code in codes:
+        if not re.fullmatch(IGNORE_PATTERN, code, re.IGNORECASE):
+            return code, "UNKNOWN"
+    return None, None
 
 
 def safe_filename(text):
@@ -82,61 +100,73 @@ def unique_target(folder, stem, ext, current, claimed):
     return target
 
 
-def process(folder, dry_run=False, recursive=False):
-    pattern = "**/*" if recursive else "*"
-    files = sorted(p for p in folder.glob(pattern)
-                   if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+def process(folder, dry_run=False, recursive=False, output=None, patterns=COURIER_PATTERNS):
+    glob_pattern = "**/*" if recursive else "*"
+    files = sorted(p for p in folder.glob(glob_pattern)
+                   if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+                   and not (output and p.is_relative_to(output)))
     if not files:
         print(f"No images found in {folder}")
         return
 
-    log_path = folder / f"qr_rename_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
-    renamed = failed = 0
+    if output and not dry_run:
+        output.mkdir(parents=True, exist_ok=True)
+    log_path = (output if output and not dry_run else folder) / f"qr_rename_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    renamed = failed = check = 0
     rows = []
     claimed = set()  # names already assigned this run (needed for --dry-run)
 
     for i, path in enumerate(files, 1):
         img = load_image(path)
         if img is None:
-            status, qr, new_name = "UNREADABLE_IMAGE", "", ""
+            status, qr, courier, new_name, codes = "UNREADABLE_IMAGE", "", "", "", []
         else:
-            qr = read_qr(img)
+            codes = read_codes(img)
+            qr, courier = pick_waybill(codes, patterns)
             stem = safe_filename(qr) if qr else None
             if not stem:
-                status, qr, new_name = "NO_QR_FOUND", qr or "", ""
+                status, qr, courier, new_name = "NO_WAYBILL_FOUND", "", "", ""
             else:
-                target = unique_target(path.parent, stem, path.suffix.lower(), path, claimed)
+                target = unique_target(output or path.parent, stem, path.suffix.lower(), path, claimed)
                 claimed.add(target)
                 new_name = target.name
                 if target.resolve() == path.resolve():
                     status = "ALREADY_NAMED"
                 elif dry_run:
                     status = "DRY_RUN"
+                elif output:
+                    shutil.copy2(path, target)
+                    status = "COPIED"
                 else:
                     path.rename(target)
                     status = "RENAMED"
+                if courier == "UNKNOWN" and status != "ALREADY_NAMED":
+                    status = "CHECK_UNKNOWN_FORMAT"
 
-        if status in ("RENAMED", "DRY_RUN"):
+        if status == "CHECK_UNKNOWN_FORMAT":
+            check += 1
+        elif status in ("RENAMED", "COPIED", "DRY_RUN"):
             renamed += 1
         elif status != "ALREADY_NAMED":
             failed += 1
-        print(f"[{i}/{len(files)}] {path.name} -> {new_name or '-'}  ({status})")
-        rows.append([path.name, qr, new_name, status])
+        print(f"[{i}/{len(files)}] {path.name} -> {new_name or '-'}  ({courier or '-'}, {status})")
+        rows.append([path.name, courier, qr, new_name, status, " | ".join(codes)])
 
     with open(log_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["original_file", "qr_value", "new_file", "status"])
+        writer.writerow(["original_file", "courier", "waybill", "new_file", "status", "all_codes_found"])
         writer.writerows(rows)
 
-    verb = "Would rename" if dry_run else "Renamed"
-    print(f"\n{verb}: {renamed}   Failed: {failed}   Total: {len(files)}")
+    verb = "Would rename" if dry_run else ("Copied" if output else "Renamed")
+    print(f"\n{verb}: {renamed}   Check (unknown format): {check}   Failed: {failed}   Total: {len(files)}")
     print(f"Log saved: {log_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Rename images using their QR code value.")
+    parser = argparse.ArgumentParser(description="Rename images using their waybill QR code.")
     parser.add_argument("folder", nargs="?", help="Folder containing the images")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be renamed without renaming")
+    parser.add_argument("--output", help="Copy renamed images here instead of renaming in place")
     parser.add_argument("--recursive", action="store_true", help="Include subfolders")
     args = parser.parse_args()
 
@@ -144,7 +174,8 @@ def main():
     folder = Path(folder_arg)
     if not folder.is_dir():
         sys.exit(f"Folder not found: {folder}")
-    process(folder, dry_run=args.dry_run, recursive=args.recursive)
+    output = Path(args.output).resolve() if args.output else None
+    process(folder.resolve(), dry_run=args.dry_run, recursive=args.recursive, output=output)
 
 
 if __name__ == "__main__":
