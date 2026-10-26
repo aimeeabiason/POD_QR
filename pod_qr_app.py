@@ -1,7 +1,7 @@
 """POD photo renamer - Windows app.
 
 Reads the waybill QR code in each photo in the source folder, renames the photo
-to the waybill and moves it to <destination>/2025/03-MARCH/ based on when the
+to the waybill and moves it to <destination>/03-MARCH/ based on when the
 photo was taken. Photos that cannot be read stay in the source folder and are
 listed in the error log.
 """
@@ -67,6 +67,7 @@ class App(tk.Tk):
         self.source = tk.StringVar(value=settings.get("source", ""))
         self.dest = tk.StringVar(value=settings.get("dest", ""))
         self.log_path = tk.StringVar(value=settings.get("log", "LOG.TXT"))
+        self.subfolders = tk.BooleanVar(value=settings.get("subfolders", False))
 
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
@@ -75,20 +76,22 @@ class App(tk.Tk):
         ttk.Label(frm, text="Folder Path", font=("Segoe UI", 11, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         self._row(frm, 1, "Source Folder :", self.source, self.browse_source)
-        self._row(frm, 2, "Destination Folder :", self.dest, self.browse_dest)
-        self._row(frm, 3, "Log error path :", self.log_path, self.browse_log)
+        ttk.Checkbutton(frm, text="Include subfolders", variable=self.subfolders).grid(
+            row=2, column=1, sticky="w", pady=(0, 3))
+        self._row(frm, 3, "Destination Folder :", self.dest, self.browse_dest)
+        self._row(frm, 4, "Log error path :", self.log_path, self.browse_log)
 
         self.run_btn = ttk.Button(frm, text="RENAME & SAVE PHOTO", command=self.start)
-        self.run_btn.grid(row=4, column=1, columnspan=2, sticky="e", pady=10)
+        self.run_btn.grid(row=5, column=1, columnspan=2, sticky="e", pady=10)
 
         self.progress = ttk.Progressbar(frm, mode="determinate")
-        self.progress.grid(row=5, column=0, columnspan=3, sticky="ew")
+        self.progress.grid(row=6, column=0, columnspan=3, sticky="ew")
         self.status = ttk.Label(frm, text="Ready")
-        self.status.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 4))
+        self.status.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 4))
 
         self.output = tk.Text(frm, height=12, state="disabled", wrap="none")
-        self.output.grid(row=7, column=0, columnspan=3, sticky="nsew")
-        frm.rowconfigure(7, weight=1)
+        self.output.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        frm.rowconfigure(8, weight=1)
 
     def _row(self, parent, row, label, var, command):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -135,18 +138,25 @@ class App(tk.Tk):
             messagebox.showerror("Destination Folder", "Destination must be different from the source folder.")
             return
 
-        save_settings({"source": str(source), "dest": str(dest), "log": self.log_path.get()})
+        subfolders = self.subfolders.get()
+        save_settings({"source": str(source), "dest": str(dest), "log": self.log_path.get(),
+                       "subfolders": subfolders})
         self.run_btn.configure(state="disabled")
         self.output.configure(state="normal")
         self.output.delete("1.0", "end")
         self.output.configure(state="disabled")
-        threading.Thread(target=self.process, args=(source, dest, self.resolve_log(dest)), daemon=True).start()
+        threading.Thread(target=self.process, args=(source, dest, self.resolve_log(dest), subfolders),
+                         daemon=True).start()
 
     def ui(self, func, *args):
         self.after(0, func, *args)
 
-    def process(self, source, dest, log_path):
-        files = sorted(p for p in source.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+    def process(self, source, dest, log_path, subfolders=False):
+        candidates = source.rglob("*") if subfolders else source.iterdir()
+        # Skip the destination if it sits inside the source, so filed photos aren't processed again
+        dest_resolved = dest.resolve()
+        files = sorted(p for p in candidates if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+                       and not p.resolve().is_relative_to(dest_resolved))
         total = len(files)
         self.ui(self.progress.configure, {"maximum": max(total, 1), "value": 0})
         if not total:
@@ -158,7 +168,8 @@ class App(tk.Tk):
         saved = 0
         claimed = set()
         for i, path in enumerate(files, 1):
-            self.ui(self.status.configure, {"text": f"Processing {i}/{total}: {path.name}"})
+            name = path.relative_to(source)  # includes the subfolder, if any
+            self.ui(self.status.configure, {"text": f"Processing {i}/{total}: {name}"})
             try:
                 img = load_image(path)
                 if img is None:
@@ -169,16 +180,16 @@ class App(tk.Tk):
                     found = f" (found: {' | '.join(codes)})" if codes else ""
                     raise ValueError(f"no waybill QR code found{found}")
                 taken = photo_date(path)
-                folder = dest / f"{taken:%Y}" / f"{taken:%m}-{MONTHS[taken.month - 1]}"
+                folder = dest / f"{taken:%m}-{MONTHS[taken.month - 1]}"
                 folder.mkdir(parents=True, exist_ok=True)
                 target = unique_target(folder, stem, path.suffix.lower(), path, claimed)
                 claimed.add(target)
                 shutil.move(str(path), str(target))
                 saved += 1
-                self.ui(self.write, f"OK     {path.name} -> {target.relative_to(dest)}")
+                self.ui(self.write, f"OK     {name} -> {target.relative_to(dest)}")
             except Exception as e:
                 errors.append(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {path}  ERROR: {e}")
-                self.ui(self.write, f"ERROR  {path.name}: {e}")
+                self.ui(self.write, f"ERROR  {name}: {e}")
             self.ui(self.progress.configure, {"value": i})
 
         if errors:
