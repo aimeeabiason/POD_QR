@@ -7,6 +7,7 @@ listed in the error log.
 """
 import json
 import shutil
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -18,7 +19,9 @@ from PIL import Image
 from pod_qr_rename import (IMAGE_EXTS, load_image, pick_waybill, read_codes,
                            safe_filename, unique_target)
 
-SETTINGS_FILE = Path(__file__).with_name("pod_qr_settings.json")
+# When built as an .exe, keep settings next to the .exe, not in its temp unpack folder
+APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+SETTINGS_FILE = APP_DIR / "pod_qr_settings.json"
 EXIF_DATETIME_ORIGINAL = 36867
 EXIF_DATETIME = 306
 # Fixed English names so folder names don't depend on the PC's language setting
