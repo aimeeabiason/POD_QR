@@ -137,7 +137,14 @@ def rename_photos(source, dest, log_path, subfolders, compress=False, report=pri
             target = unique_target(folder, stem, ext, path, claimed)
             claimed.add(target)
             if data:
-                target.write_bytes(data)
+                try:
+                    target.write_bytes(data)
+                    if target.stat().st_size != len(data):
+                        raise OSError("compressed photo was not fully saved")
+                except BaseException:
+                    # Don't leave an empty or partial file behind; the original stays in the source
+                    target.unlink(missing_ok=True)
+                    raise
                 path.unlink()
             else:
                 shutil.move(str(path), str(target))
@@ -148,18 +155,18 @@ def rename_photos(source, dest, log_path, subfolders, compress=False, report=pri
             shrunk = f"  ({original_size / 1e6:.1f} MB -> {new_size / 1e6:.1f} MB)" if data else ""
             report(f"OK     {name} -> {target.relative_to(dest)}{shrunk}")
         except Exception as e:
-            errors.append(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {path}  ERROR: {e}")
+            line = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {path}  ERROR: {e}"
+            errors.append(line)
             report(f"ERROR  {name}: {e}")
+            # Log each error straight away so it isn't lost if the run is stopped part way
+            try:
+                write_log(log_path, [line])
+            except Exception as log_error:
+                report(f"Could not write log {log_path}: {log_error}")
     if progress:
         progress(total, total, None)
     if compress and size_before:
         report(f"Total size: {size_before / 1e6:.1f} MB -> {size_after / 1e6:.1f} MB")
-
-    if errors:
-        try:
-            write_log(log_path, errors)
-        except Exception as e:
-            report(f"Could not write log {log_path}: {e}")
     return saved, len(errors), total
 
 
