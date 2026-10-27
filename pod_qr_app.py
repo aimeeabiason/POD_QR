@@ -1,9 +1,11 @@
 """POD photo renamer - Windows app.
 
 Reads the waybill QR code in each photo in the source folder, renames the photo
-to the waybill and moves it to <destination>/03-MARCH/ based on when the
-photo was taken. Photos that cannot be read stay in the source folder and are
-listed in the error log.
+to the waybill and moves it to <destination>/03-MARCH/JT/ based on when the
+photo was taken and the first 2 characters of the waybill (JT, PH, ...). Photos with no readable waybill QR code are compressed and
+moved, under their original name, to <destination>/ERROR_10272026/ (the date of
+the run). Photos that cannot be opened at all stay in the source folder. Both
+are listed in the error log.
 
 Run with --auto (e.g. from Task Scheduler) to process the saved folders without
 opening the window; errors go to the error log as usual.
@@ -71,6 +73,32 @@ def compressed_jpeg(path):
     return data if len(data) < path.stat().st_size else None
 
 
+class NoWaybill(ValueError):
+    pass
+
+
+def save_photo(path, folder, stem, compress, claimed):
+    """Move path to folder/stem, compressed if that makes it smaller. Returns (target, compressed)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    data = compressed_jpeg(path) if compress else None
+    ext = ".jpg" if data else path.suffix.lower()
+    target = unique_target(folder, stem, ext, path, claimed)
+    claimed.add(target)
+    if data:
+        try:
+            target.write_bytes(data)
+            if target.stat().st_size != len(data):
+                raise OSError("compressed photo was not fully saved")
+        except BaseException:
+            # Don't leave an empty or partial file behind; the original stays in the source
+            target.unlink(missing_ok=True)
+            raise
+        path.unlink()
+    else:
+        shutil.move(str(path), str(target))
+    return target, bool(data)
+
+
 def load_settings():
     try:
         return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -111,6 +139,7 @@ def rename_photos(source, dest, log_path, subfolders, compress=False, report=pri
         return 0, 0, 0
 
     dest.mkdir(parents=True, exist_ok=True)
+    error_folder = dest / f"ERROR_{datetime.now():%m%d%Y}"
     errors = []
     saved = 0
     size_before = size_after = 0
@@ -119,6 +148,7 @@ def rename_photos(source, dest, log_path, subfolders, compress=False, report=pri
         name = path.relative_to(source)  # includes the subfolder, if any
         if progress:
             progress(i, total, name)
+        original_size = path.stat().st_size
         try:
             img = load_image(path)
             if img is None:
@@ -127,34 +157,27 @@ def rename_photos(source, dest, log_path, subfolders, compress=False, report=pri
             stem = safe_filename(pick_waybill(codes) or "")
             if not stem:
                 found = f" (found: {' | '.join(codes)})" if codes else ""
-                raise ValueError(f"no waybill QR code found{found}")
+                raise NoWaybill(f"no waybill QR code found{found}")
             taken = photo_date(path)
-            folder = dest / f"{taken:%m}-{MONTHS[taken.month - 1]}"
-            folder.mkdir(parents=True, exist_ok=True)
-            original_size = path.stat().st_size
-            data = compressed_jpeg(path) if compress else None
-            ext = ".jpg" if data else path.suffix.lower()
-            target = unique_target(folder, stem, ext, path, claimed)
-            claimed.add(target)
-            if data:
-                try:
-                    target.write_bytes(data)
-                    if target.stat().st_size != len(data):
-                        raise OSError("compressed photo was not fully saved")
-                except BaseException:
-                    # Don't leave an empty or partial file behind; the original stays in the source
-                    target.unlink(missing_ok=True)
-                    raise
-                path.unlink()
-            else:
-                shutil.move(str(path), str(target))
+            # e.g. 10-OCTOBER\JT for JT0026146091628; created only if missing
+            folder = dest / f"{taken:%m}-{MONTHS[taken.month - 1]}" / stem[:2].upper()
+            target, compressed = save_photo(path, folder, stem, compress, claimed)
             saved += 1
             new_size = target.stat().st_size
             size_before += original_size
             size_after += new_size
-            shrunk = f"  ({original_size / 1e6:.1f} MB -> {new_size / 1e6:.1f} MB)" if data else ""
+            shrunk = f"  ({original_size / 1e6:.1f} MB -> {new_size / 1e6:.1f} MB)" if compressed else ""
             report(f"OK     {name} -> {target.relative_to(dest)}{shrunk}")
         except Exception as e:
+            if isinstance(e, NoWaybill):
+                # Always compressed, so unreadable photos don't fill the drive
+                try:
+                    target, _ = save_photo(path, error_folder, path.stem, True, claimed)
+                    size_before += original_size
+                    size_after += target.stat().st_size
+                    e = f"{e}; saved to {target.relative_to(dest)}"
+                except Exception as save_error:
+                    e = f"{e}; could not save to {error_folder.name}, left in source: {save_error}"
             line = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {path}  ERROR: {e}"
             errors.append(line)
             report(f"ERROR  {name}: {e}")
@@ -165,7 +188,7 @@ def rename_photos(source, dest, log_path, subfolders, compress=False, report=pri
                 report(f"Could not write log {log_path}: {log_error}")
     if progress:
         progress(total, total, None)
-    if compress and size_before:
+    if size_before:
         report(f"Total size: {size_before / 1e6:.1f} MB -> {size_after / 1e6:.1f} MB")
     return saved, len(errors), total
 
@@ -311,7 +334,8 @@ class App(tk.Tk):
         self.status.configure(text=message)
         self.run_btn.configure(state="normal")
         if log_path:
-            message += f"\n\nPhotos with errors were left in the source folder.\nError log: {log_path}"
+            message += ("\n\nPhotos with no readable QR code were saved to the ERROR_ folder "
+                        f"in the destination.\nError log: {log_path}")
         messagebox.showinfo("POD Photo Renamer", message)
 
 
