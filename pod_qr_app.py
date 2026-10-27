@@ -7,7 +7,13 @@ listed in the error log.
 
 Run with --auto (e.g. from Task Scheduler) to process the saved folders without
 opening the window; errors go to the error log as usual.
+
+With "Compress photos" on, each photo is saved as a JPEG no larger than
+MAX_SIDE pixels on its longest side, which usually cuts the file size by 70-90%
+while the waybill and signature stay sharp. The original is kept as-is if
+compressing would not make it smaller.
 """
+import io
 import json
 import shutil
 import sys
@@ -17,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from pod_qr_rename import (IMAGE_EXTS, load_image, pick_waybill, read_codes,
                            safe_filename, unique_target)
@@ -30,6 +36,9 @@ EXIF_DATETIME = 306
 # Fixed English names so folder names don't depend on the PC's language setting
 MONTHS = ("JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
           "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER")
+# Compression: longest side in pixels and JPEG quality (85 shows no visible loss)
+MAX_SIDE = 2560
+JPEG_QUALITY = 85
 
 
 def photo_date(path):
@@ -44,6 +53,22 @@ def photo_date(path):
         pass
     stat = path.stat()
     return datetime.fromtimestamp(min(stat.st_ctime, stat.st_mtime))
+
+
+def compressed_jpeg(path):
+    """Photo re-encoded as a smaller JPEG (bytes), or None if that would not be smaller."""
+    with Image.open(path) as im:
+        # Bake in the camera rotation so the photo shows upright without the EXIF tag
+        im = ImageOps.exif_transpose(im)
+        exif = im.getexif()
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        im.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True, progressive=True,
+                exif=exif.tobytes())
+    data = buf.getvalue()
+    return data if len(data) < path.stat().st_size else None
 
 
 def load_settings():
@@ -72,7 +97,7 @@ def write_log(log_path, lines):
         f.write("\n".join(lines) + "\n")
 
 
-def rename_photos(source, dest, log_path, subfolders, report=print, progress=None):
+def rename_photos(source, dest, log_path, subfolders, compress=False, report=print, progress=None):
     """Rename and file every photo in source. Returns (saved, failed, total)."""
     candidates = source.rglob("*") if subfolders else source.iterdir()
     # Skip the destination if it sits inside the source, so filed photos aren't processed again
@@ -88,6 +113,7 @@ def rename_photos(source, dest, log_path, subfolders, report=print, progress=Non
     dest.mkdir(parents=True, exist_ok=True)
     errors = []
     saved = 0
+    size_before = size_after = 0
     claimed = set()
     for i, path in enumerate(files):
         name = path.relative_to(source)  # includes the subfolder, if any
@@ -105,16 +131,29 @@ def rename_photos(source, dest, log_path, subfolders, report=print, progress=Non
             taken = photo_date(path)
             folder = dest / f"{taken:%m}-{MONTHS[taken.month - 1]}"
             folder.mkdir(parents=True, exist_ok=True)
-            target = unique_target(folder, stem, path.suffix.lower(), path, claimed)
+            original_size = path.stat().st_size
+            data = compressed_jpeg(path) if compress else None
+            ext = ".jpg" if data else path.suffix.lower()
+            target = unique_target(folder, stem, ext, path, claimed)
             claimed.add(target)
-            shutil.move(str(path), str(target))
+            if data:
+                target.write_bytes(data)
+                path.unlink()
+            else:
+                shutil.move(str(path), str(target))
             saved += 1
-            report(f"OK     {name} -> {target.relative_to(dest)}")
+            new_size = target.stat().st_size
+            size_before += original_size
+            size_after += new_size
+            shrunk = f"  ({original_size / 1e6:.1f} MB -> {new_size / 1e6:.1f} MB)" if data else ""
+            report(f"OK     {name} -> {target.relative_to(dest)}{shrunk}")
         except Exception as e:
             errors.append(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {path}  ERROR: {e}")
             report(f"ERROR  {name}: {e}")
     if progress:
         progress(total, total, None)
+    if compress and size_before:
+        report(f"Total size: {size_before / 1e6:.1f} MB -> {size_after / 1e6:.1f} MB")
 
     if errors:
         try:
@@ -148,7 +187,7 @@ def run_auto():
         return 2
 
     _, failed, _ = rename_photos(source, dest, log_path, settings.get("subfolders", False),
-                                 report=lambda line: None)
+                                 settings.get("compress", True), report=lambda line: None)
     return 1 if failed else 0
 
 
@@ -163,6 +202,7 @@ class App(tk.Tk):
         self.dest = tk.StringVar(value=settings.get("dest", ""))
         self.log_path = tk.StringVar(value=settings.get("log", "LOG.TXT"))
         self.subfolders = tk.BooleanVar(value=settings.get("subfolders", False))
+        self.compress = tk.BooleanVar(value=settings.get("compress", True))
 
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
@@ -176,6 +216,8 @@ class App(tk.Tk):
         self._row(frm, 3, "Destination Folder :", self.dest, self.browse_dest)
         self._row(frm, 4, "Log error path :", self.log_path, self.browse_log)
 
+        ttk.Checkbutton(frm, text="Compress photos (smaller files, still clear)",
+                        variable=self.compress).grid(row=5, column=1, sticky="w", pady=10)
         self.run_btn = ttk.Button(frm, text="RENAME & SAVE PHOTO", command=self.start)
         self.run_btn.grid(row=5, column=1, columnspan=2, sticky="e", pady=10)
 
@@ -229,25 +271,27 @@ class App(tk.Tk):
             return
 
         subfolders = self.subfolders.get()
+        compress = self.compress.get()
         save_settings({"source": str(source), "dest": str(dest), "log": self.log_path.get(),
-                       "subfolders": subfolders})
+                       "subfolders": subfolders, "compress": compress})
         self.run_btn.configure(state="disabled")
         self.output.configure(state="normal")
         self.output.delete("1.0", "end")
         self.output.configure(state="disabled")
         log_path = resolve_log(self.log_path.get(), dest)
-        threading.Thread(target=self.process, args=(source, dest, log_path, subfolders), daemon=True).start()
+        threading.Thread(target=self.process, args=(source, dest, log_path, subfolders, compress),
+                         daemon=True).start()
 
     def ui(self, func, *args):
         self.after(0, func, *args)
 
-    def process(self, source, dest, log_path, subfolders):
+    def process(self, source, dest, log_path, subfolders, compress):
         def progress(i, total, name):
             self.ui(self.progress.configure, {"maximum": max(total, 1), "value": i})
             if name:
                 self.ui(self.status.configure, {"text": f"Processing {i + 1}/{total}: {name}"})
 
-        saved, failed, total = rename_photos(source, dest, log_path, subfolders,
+        saved, failed, total = rename_photos(source, dest, log_path, subfolders, compress,
                                              report=lambda line: self.ui(self.write, line),
                                              progress=progress)
         if not total:
